@@ -337,11 +337,36 @@ plt.show()
 
 
 # ─────────────────────────────────────────────────────────
-# STEP 5 — REAL TIME INFERENCE WITH MEDIAPIPE + WEBCAM
+# STEP 5 — REAL TIME: FACE ID + EMOTION
 # ─────────────────────────────────────────────────────────
 
+import torch.nn.functional as F
+
+# load emotion model
 model.load_state_dict(torch.load("emotion_cnn.pth"))
 model.eval()
+
+# load face embedder (same ResNet18 extractor)
+embedder = models.resnet18(pretrained=True)
+embedder.fc = torch.nn.Identity()
+embedder = embedder.to(DEVICE)
+embedder.eval()
+
+# load your saved face embedding
+dark_embedding = np.load("dark_embedding.npy")
+dark_tensor    = torch.tensor(dark_embedding).to(DEVICE)
+
+THRESHOLD = 0.75
+# cosine similarity above this = it's you
+# below this = unknown face
+# 0.75 is a good starting point, adjust if needed
+
+def get_embedding(face_img):
+    pil    = Image.fromarray(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
+    tensor = transform(pil).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        emb = embedder(tensor)
+    return emb.squeeze()
 
 inference_transform = transforms.Compose([
     transforms.Resize((64, 64)),
@@ -350,116 +375,88 @@ inference_transform = transforms.Compose([
     transforms.Normalize([0.5]*3, [0.5]*3)
 ])
 
-mp_face    = mp.solutions.face_detection
-mp_draw    = mp.solutions.drawing_utils
-# drawing_utils — MediaPipe's helper to draw landmarks
-# and bounding boxes on frames
+EMOTIONS = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
 
+mp_face  = mp.solutions.face_detection
 detector = mp_face.FaceDetection(min_detection_confidence=0.7)
-# min_detection_confidence=0.7 means MediaPipe only
-# reports a face if it's 70%+ confident it's a face
-# lower = more detections but more false positives
-# higher = fewer but more accurate detections
+cap      = cv2.VideoCapture(0)
 
-cap = cv2.VideoCapture(0)
-# 0 = default webcam
-# replace with video file path to run on a video
-
-print("\nWebcam running — press Q to quit")
+print("Webcam running — press Q to quit")
 
 while True:
     ret, frame = cap.read()
-    # ret: True if frame read successfully
-    # frame: numpy array of shape (height, width, 3)
-
     if not ret:
         break
 
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    # MediaPipe expects RGB
-    # OpenCV gives BGR by default
-    # must convert before passing to MediaPipe
-
+    rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = detector.process(rgb)
-    # runs face detection on the frame
-    # returns bounding boxes for all detected faces
 
     if results.detections:
         for detection in results.detections:
             bbox = detection.location_data.relative_bounding_box
-            # bounding box is in relative coordinates (0.0 to 1.0)
-            # multiply by frame dimensions to get pixel coords
-
             h, w = frame.shape[:2]
             x  = max(0, int(bbox.xmin * w))
             y  = max(0, int(bbox.ymin * h))
             bw = int(bbox.width * w)
             bh = int(bbox.height * h)
-            # max(0, ...) prevents negative coordinates
-            # which would crash the crop
 
             face_crop = frame[y:y+bh, x:x+bw]
-            # numpy array slicing to crop the face region
-            # [rows, columns] = [y:y+height, x:x+width]
-
             if face_crop.size == 0:
                 continue
-            # skip if crop is empty
-            # happens at edge of frame
 
+            # ── who is this? ──────────────────────────────
+            live_emb  = get_embedding(face_crop)
+            similarity = F.cosine_similarity(
+                live_emb.unsqueeze(0),
+                dark_tensor.unsqueeze(0)
+            ).item()
+            # cosine similarity measures angle between
+            # two vectors — 1.0 = identical, 0.0 = unrelated
+            # if your embedding and live face point in the
+            # same direction in 512-dim space = same person
+
+            name  = "Dark" if similarity > THRESHOLD else "Unknown"
+            color = (0, 255, 0) if name == "Dark" else (0, 0, 255)
+            # green for you, red for unknown
+
+            # ── what emotion? ─────────────────────────────
             pil_img = Image.fromarray(
                 cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
             )
-            # convert numpy array → PIL Image
-            # needed because transforms expect PIL format
-
-            tensor = inference_transform(pil_img).unsqueeze(0).to(DEVICE)
-            # unsqueeze(0) adds batch dimension
-            # model expects [batch, channels, height, width]
-            # single image needs to become [1, 3, 64, 64]
+            tensor  = inference_transform(pil_img).unsqueeze(0).to(DEVICE)
 
             with torch.no_grad():
-                emotion_out, intensity_out, valence_out = model(tensor)
+                emotion_out, intensity_out, _ = model(tensor)
                 class_idx  = emotion_out.argmax(dim=1).item()
                 confidence = torch.softmax(emotion_out, dim=1).max().item()
-                # softmax converts raw scores → probabilities
-                # all values sum to 1.0
-                # .max() gives the highest probability
-
-                intensity = intensity_out.item()
-                valence   = "positive" if valence_out.argmax(dim=1).item() == 0 \
-                            else "negative"
+                intensity  = intensity_out.item()
 
             emotion = EMOTIONS[class_idx]
 
-            # draw bounding box
-            cv2.rectangle(frame, (x, y), (x+bw, y+bh), (0, 255, 0), 2)
+            # ── draw on screen ────────────────────────────
+            cv2.rectangle(frame, (x, y), (x+bw, y+bh), color, 2)
 
-            # draw emotion label above the box
-            label = f"{emotion} {confidence*100:.0f}% | intensity: {intensity:.2f}"
-            cv2.putText(frame, label, (x, y - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # name above the box
+            cv2.putText(frame, name,
+                       (x, y - 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
-            # this output dict is what goes to Automation Engine
-            output = {
+            # emotion below the name
+            cv2.putText(frame, f"{emotion} {confidence*100:.0f}%",
+                       (x, y - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            print({
+                "name":      name,
+                "similarity": round(similarity, 2),
                 "emotion":   emotion,
-                "intensity": round(intensity, 2),
-                "valence":   valence,
-                "confidence": round(confidence, 2)
-            }
-            print(output)  # in real system → send to constraint planner
+                "confidence": round(confidence*100, 1),
+                "intensity": round(intensity, 2)
+            })
 
-    cv2.imshow("Emotion Engine", frame)
-    # imshow opens a window and displays the frame
-
+    cv2.imshow("Home AI — Identity + Emotion", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
-    # waitKey(1) waits 1ms for a keypress
-    # if Q pressed → exit loop
 
 cap.release()
-# release webcam so other apps can use it
 cv2.destroyAllWindows()
-# close all OpenCV windows cleanly
-
-#chnages to be made for better accuracy and detection of other emotions
