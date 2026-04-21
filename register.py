@@ -5,17 +5,12 @@ import torch
 from torchvision import models, transforms
 from PIL import Image
 import time
+import os
 
-# we use ResNet18 as a feature extractor
-# remove its final classification layer
-# what's left outputs a 512-dim face embedding
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 embedder = models.resnet18(pretrained=True)
 embedder.fc = torch.nn.Identity()
-# Identity() means "don't do anything"
-# just pass the 512-dim vector straight through
-# this turns ResNet into a face feature extractor
 embedder = embedder.to(DEVICE)
 embedder.eval()
 
@@ -32,16 +27,20 @@ def get_embedding(face_img):
         emb = embedder(tensor)
     return emb.squeeze().cpu().numpy()
 
+# ── ask who is registering ────────────────────────────────
+name = input("Enter your name: ").strip().lower()
+print(f"Registering: {name}")
+print("Move your head slightly — left, right, up, down, tilt")
+
 mp_face  = mp.solutions.face_detection
 detector = mp_face.FaceDetection(min_detection_confidence=0.7)
 cap      = cv2.VideoCapture(0)
 
 embeddings = []
-print("Look at the camera from different angles...")
-print("Collecting 60 frames — move your head slightly left, right, up, down")
-
 count = 0
-while count < 60:
+TARGET = 60  # collect 60 embeddings
+
+while count < TARGET:
     ret, frame = cap.read()
     if not ret:
         break
@@ -65,21 +64,22 @@ while count < 60:
             emb = get_embedding(face_crop)
             embeddings.append(emb)
             count += 1
-            time.sleep(0.1)
+            time.sleep(0.05)
 
             cv2.rectangle(frame, (x, y), (x+bw, y+bh), (0, 255, 0), 2)
-            cv2.putText(frame, f"Capturing... {count}/60",
+            cv2.putText(frame, f"Capturing {name}... {count}/{TARGET}",
                        (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
-    cv2.imshow("Register Face — Dark", frame)
+    cv2.imshow("Register", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()
 cv2.destroyAllWindows()
 
-# average all 60 embeddings into one reference vector
-# averaging makes it robust to lighting and angle variation
-mean_embedding = np.mean(embeddings, axis=0)
-np.save("dark_embedding.npy", mean_embedding)
-print(f"Done — dark_embedding.npy saved ({len(embeddings)} frames captured)")
+# ── save as a STACK not just average ─────────────────────
+# keeping all 60 embeddings (not just mean)
+# gives much better recognition across angles
+os.makedirs("faces", exist_ok=True)
+np.save(f"faces/{name}.npy", np.array(embeddings))
+print(f"Saved → faces/{name}.npy ({len(embeddings)} embeddings)")
