@@ -15,6 +15,7 @@ from torchvision import transforms, datasets, models
 from torch.utils.data import DataLoader
 from torch import optim
 from PIL import Image
+from collections import Counter
 
 # ─────────────────────────────────────────────────────────
 # CONFIG
@@ -22,8 +23,8 @@ from PIL import Image
 
 DATA_DIR   = "./fer2013"
 BATCH_SIZE = 32
-EPOCHS     = 15
-LR         = 1e-3
+EPOCHS     = 30
+LR         = 1e-4
 DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 EMOTIONS   = ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
 
@@ -39,6 +40,7 @@ train_transforms = transforms.Compose([
     transforms.Grayscale(num_output_channels=3),
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(10),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3),
     transforms.ToTensor(),
     transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
 ])
@@ -70,8 +72,13 @@ class EmotionCNN(nn.Module):
 
         self.base = models.resnet18(pretrained=True)
 
-        for param in self.base.parameters():
-            param.requires_grad = False
+        # freeze only early layers
+        # unfreeze layer3, layer4, fc so they adapt to FER2013
+        for name, param in self.base.named_parameters():
+            if "layer3" in name or "layer4" in name or "fc" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
         self.base.fc = nn.Sequential(
             nn.Linear(self.base.fc.in_features, 512),
@@ -101,9 +108,19 @@ print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 # STEP 3 — TRAINING
 # ─────────────────────────────────────────────────────────
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=LR)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+# class weights — penalizes model more for getting
+# rare emotions wrong (fixes happy dominance)
+label_counts = Counter(train_data.targets)
+total        = len(train_data)
+weights      = [total / label_counts[i] for i in range(len(EMOTIONS))]
+weights      = torch.tensor(weights, dtype=torch.float).to(DEVICE)
+
+criterion = nn.CrossEntropyLoss(weight=weights)
+optimizer = optim.Adam(
+    filter(lambda p: p.requires_grad, model.parameters()),
+    lr=LR
+)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=8, gamma=0.5)
 
 train_losses, train_accs, test_accs = [], [], []
 
@@ -286,28 +303,31 @@ while True:
             tensor  = inference_transform(pil_img).unsqueeze(0).to(DEVICE)
 
             with torch.no_grad():
-                emotion_out, intensity_out, _ = model(tensor)
-                class_idx  = emotion_out.argmax(dim=1).item()
-                confidence = torch.softmax(emotion_out, dim=1).max().item()
-                intensity  = intensity_out.item()
+                emotion_out, _, _ = model(tensor)
+                class_idx         = emotion_out.argmax(dim=1).item()
+                probs             = torch.softmax(emotion_out, dim=1)
+                confidence        = probs.max().item()
+                # intensity derived from confidence
+                # high confidence = strong emotion
+                intensity         = round(confidence, 2)
 
             emotion = EMOTIONS[class_idx]
 
             # ── draw on screen ────────────────────────────
             cv2.rectangle(frame, (x, y), (x+bw, y+bh), color, 2)
-            cv2.putText(frame, name,
+            cv2.putText(frame, f"{name} ({similarity})",
                        (x, y - 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-            cv2.putText(frame, f"{emotion} {confidence*100:.0f}%",
+            cv2.putText(frame, f"{emotion} {confidence*100:.0f}% | intensity: {intensity}",
                        (x, y - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             print({
                 "name":       name,
                 "similarity": similarity,
                 "emotion":    emotion,
                 "confidence": round(confidence * 100, 1),
-                "intensity":  round(intensity, 2)
+                "intensity":  intensity
             })
 
     cv2.imshow("Home AI — Identity + Emotion", frame)
